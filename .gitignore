@@ -1,0 +1,53 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Python tooling
+.pytest_cache/
+.mypy_cache/
+.pyre/
+.tox/
+.nox/
+.coverage
+coverage.xml
+htmlcov/
+
+# IDEs and editors
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs and runtime files
+logs/
+*.log
+*.tmp
+.tmp/
+tmp/
+
+# Secrets and config (config.json intentionally stores token per project policy)
+config.json
+config.*.json
+
+
+
+
+# Docker overrides
+docker-compose.override.yml
+
