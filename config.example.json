@@ -1,6 +1,5 @@
 {
   "token": "YOUR_DISCORD_BOT_TOKEN_HERE",
-  "join_sound": "assets/join_sound.opus",
   "default_duration": 5,
   "max_duration": 10,
   "playback_delay": 1,
