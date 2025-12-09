@@ -16,4 +16,6 @@ if [ ! -d "$VENV_DIR" ]; then
 fi
 
 source "$VENV_DIR/bin/activate"
-python3 bot.py --config "$CONFIG_FILE"
+# Forward any additional args (e.g. --debug, --debug-all) to bot.py
+echo python3 bot.py --config "$CONFIG_FILE" "$@"
+python3 bot.py --config "$CONFIG_FILE" "$@"
