@@ -83,10 +83,12 @@ Configurable parameters in JSON:
 - NO persistent storage of audio or long-term metadata. The system must avoid writing any recordings to disk unless absolutely necessary for playback. If disk is used, files must be immediately deleted after playback.
 - No list or delete commands for stored snippets since nothing is stored persistently. The `/list` and `/delete` commands are intentionally omitted in this privacy-first design (unless a very short-lived in-memory listing UI is desired, in which case it must be ephemeral and cleared after a short TTL).
 
+
 ## Join Sound Behavior
 
-- When the bot joins a voice channel, it will immediately play a configured join sound referenced in the JSON config (`join_sound`). The config should accept relative paths inside the project (e.g., `assets/join_sound.opus`).
-- if that sound doesn't exist on startup, fail to start. check that the file exists and is a valid playable sound file
+- The project will use a hard-coded join sound path inside the repository: `assets/join_sound.opus`.
+- This sound is not supplied through the JSON config; instead the bot will reference the file at runtime directly. Expect the file to be added to the project (do not commit sensitive audio into public repos).
+- On startup the bot will check that `assets/join_sound.opus` exists and is playable; if missing, the bot will fail to start with an error so you can add the asset.
 
 ## Concurrency, Rate-Limits & Safety
 
