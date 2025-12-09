@@ -43,7 +43,6 @@ tmp/
 
 # Secrets and config (config.json intentionally stores token per project policy)
 config.json
-config.*.json
 
 
 
