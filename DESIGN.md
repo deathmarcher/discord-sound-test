@@ -2,6 +2,8 @@
 
 # Discord Sound Test — Design Document
 
+This document was written with copilot in order to guide copilot in the continued development of the project
+
 ## Overview
 
 Purpose: build a privacy-focused Python Discord bot that joins voice channels, plays a configured join sound, and performs short, single-user voice tests that capture a specific user's audio for a short duration (default 5s) and immediately plays it back with a short delay before deleting it from memory. This document captures explicit constraints for implementation so Copilot can scaffold the project consistently.
@@ -13,7 +15,7 @@ Important constraints provided by the project owner:
 
 ## Goals
 - Single-user, user-triggered voice tests (only the requesting user can trigger their own test).
-- Play a pre-recorded join sound (configurable path/URL) whenever the bot joins a voice channel.
+- Announce via locally-generated in-voice TTS when the bot joins a voice channel and before recording starts.
 - Record for a short configurable duration, play back the snippet after a configurable delay, then immediately delete any stored audio data.
 - Avoid persistent storage of audio; ephemeral in-memory buffering only with immediate disposal.
 - Provide a message-based UI (slash commands + an optional `/postvoicetestcommands` that posts a message with interactive buttons for join/leave/test).
@@ -64,10 +66,9 @@ Important runtime constraints:
 ## Audio Capture & Format (privacy-first)
 
 - Prefer capturing decoded PCM frames directly into an in-memory buffer (48 kHz, mono). The capture component must filter incoming frames by the invoking user's voice data only.
-- Where the voice library requires files for playback, write to a securely created temporary file (in project `.tmp` or system tmp), feed `ffmpeg` or library for playback, then securely delete the file immediately (unlink and zeroing isn't necessary for this scope, but ensure deletion is immediate).
-- We aim to have 2 methods. memory only or overflow into a .tmp file and we'll delete the .tmp file method later if we see that the in memory solution is possible without too much memory/performance issues
-- Default file format for transient files: WAV for simplicity; playback can be performed through `ffmpeg` to ensure compatibility.
-- Playback flow: record (in-memory) -> optional transient file -> playback -> delete buffer & file.
+- This project now generates audible announcements locally via `espeak-ng` (piped to the bot) and prefers an entirely in-memory TTS + record + playback flow to avoid leaving audio on disk.
+- If a voice library requires files for playback, those are a last resort. Any transient files MUST be deleted immediately after use and clearly documented; the primary implementation should avoid disk writes for TTS and recordings.
+- Playback flow (preferred): record (in-memory) -> playback (in-memory) -> discard buffer.
 
 Configurable parameters in JSON:
 - `join_sound`: path to an Opus/MP3/OGG file to play when joining.
@@ -136,7 +137,6 @@ Config file example (JSON schema snippet):
 ```json
 {
 	"token": "YOUR_DISCORD_TOKEN_IN_CONFIG_FILE",
-	"join_sound": "assets/join_sound.opus",
 	"default_duration": 5,
 	"max_duration": 10,
 	"playback_delay": 1,
