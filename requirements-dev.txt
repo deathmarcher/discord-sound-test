@@ -1,0 +1,9 @@
+--requirement requirements.txt
+
+# Development and test dependencies
+pytest
+pytest-asyncio
+pytest-cov
+anyio
+black
+ruff
