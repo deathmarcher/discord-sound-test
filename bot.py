@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
-"""Discord Sound Test - prototype scaffold
+"""Discord Sound Test — privacy-first voice test bot
 
-This scaffold follows the project's DESIGN.md constraints:
-- No environment variables; configuration is provided via `--config` JSON.
-- Plays a configured join sound on join.
-- Provides slash command stubs for `/join`, `/leave`, `/voicetest`, `/postvoicetestcommands`, and `/stop`.
 
-Voice receive (capturing user audio) is library-dependent and non-trivial; the
-`record_user_audio` function is a clear TODO where a suitable receive API
-implementation should be added (or a maintained fork of discord.py used).
-
-This file is intentionally minimal and safe: it demonstrates command flows
-and playback using `ffmpeg` via `FFmpegPCMAudio`, but does not implement a
-production-ready receive pipeline.
+Quick summary:
+- Configuration: supplied via `--config <path>` JSON (no environment vars).
+- Privacy: records only when explicitly triggered by a user; recordings are
+    stored in-memory and not written to disk.
+- TTS: uses local `espeak-ng` (stdout) for audible announcements; if TTS is
+    unavailable the bot will refuse to record to preserve audible consent.
+- Audio I/O: uses py-cord sinks (OGGSink) for receive and `ffmpeg` via
+    `FFmpegPCMAudio(pipe=True)` for playback from `io.BytesIO` buffers.
+- UI and shutdown: persistent interaction controls are re-registered on
+    startup and signal handlers perform graceful cleanup of voice clients.
 """
 
 import argparse
@@ -20,17 +19,17 @@ import asyncio
 import json
 import os
 import sys
-from pathlib import Path
+import io
 
 import discord
 from discord import FFmpegPCMAudio
 from discord.ext import commands
 import time
 import traceback
-import subprocess
 import functools
 import inspect
 import logging
+import signal
 
 # Configure module logger early so decorator and functions can use it
 logger = logging.getLogger("discord_sound_test")
@@ -38,16 +37,16 @@ logger.setLevel(logging.DEBUG)
 if not logger.handlers:
     handler = logging.StreamHandler(stream=sys.stdout)
     handler.setLevel(logging.DEBUG)
-    fmt = logging.Formatter("aaaa [%(levelname)s:%(name)s] %(asctime)s %(message)s", "%Y-%m-%d %H:%M:%S")
+    fmt = logging.Formatter(
+        "aaaa [%(levelname)s:%(name)s] %(asctime)s %(message)s", "%Y-%m-%d %H:%M:%S"
+    )
     handler.setFormatter(fmt)
     logger.addHandler(handler)
     # Keep discord library logs reasonable
     logging.getLogger("discord").setLevel(logging.INFO)
 
+bot = None
 
-
-# Directory to save debug snippets. These are kept until you remove them.
-DEBUG_SNIPPETS_DIR = "debug_snippets"
 
 # log_call decorator: logs entry/args/exceptions when its debug target is enabled
 def log_call(target: str):
@@ -56,20 +55,28 @@ def log_call(target: str):
     It works for both sync and async functions. Logging is performed at call
     time so `bot` can be set after module import.
     """
+
     def decorator(func):
         @functools.wraps(func)
         async def async_wrapper(*args, **kwargs):
             try:
                 if bot and getattr(bot, "debug", None) and bot.debug_enabled(target):
                     try:
-                        bot.debug(target, f"CALL {func.__name__} args={args} kwargs={kwargs}")
+                        bot.debug(
+                            target, f"CALL {func.__name__} args={args} kwargs={kwargs}"
+                        )
                     except Exception:
-                        logger.warning(f"[DEBUG:{target}] failed to format args for {func.__name__}")
+                        logger.warning(
+                            f"[DEBUG:{target}] failed to format args for {func.__name__}"
+                        )
                 return await func(*args, **kwargs)
             except Exception:
                 # Log exception details
                 if bot and getattr(bot, "debug", None) and bot.debug_enabled(target):
-                    bot.debug(target, f"EXCEPTION in {func.__name__}: {traceback.format_exc()}")
+                    bot.debug(
+                        target,
+                        f"EXCEPTION in {func.__name__}: {traceback.format_exc()}",
+                    )
                 raise
 
         @functools.wraps(func)
@@ -77,50 +84,26 @@ def log_call(target: str):
             try:
                 if bot and getattr(bot, "debug", None) and bot.debug_enabled(target):
                     try:
-                        bot.debug(target, f"CALL {func.__name__} args={args} kwargs={kwargs}")
+                        bot.debug(
+                            target, f"CALL {func.__name__} args={args} kwargs={kwargs}"
+                        )
                     except Exception:
-                        logger.warning(f"[DEBUG:{target}] failed to format args for {func.__name__}")
+                        logger.warning(
+                            f"[DEBUG:{target}] failed to format args for {func.__name__}"
+                        )
                 return func(*args, **kwargs)
             except Exception:
                 if bot and getattr(bot, "debug", None) and bot.debug_enabled(target):
-                    bot.debug(target, f"EXCEPTION in {func.__name__}: {traceback.format_exc()}")
+                    bot.debug(
+                        target,
+                        f"EXCEPTION in {func.__name__}: {traceback.format_exc()}",
+                    )
                 raise
 
         return async_wrapper if inspect.iscoroutinefunction(func) else sync_wrapper
 
     return decorator
 
-
-@log_call("storage")
-def save_debug_snippet(data: bytes, guild: discord.Guild, user: discord.User) -> str:
-    """Write captured audio bytes to a debug file and return the path.
-
-    This function is intentionally separate so it can be removed or disabled
-    easily after debugging. Files are written under `debug_snippets/`.
-    """
-    os.makedirs(DEBUG_SNIPPETS_DIR, exist_ok=True)
-    ts = int(time.time())
-    filename = f"snippet_g{guild.id}_u{user.id}_{ts}.ogg"
-    path = os.path.join(DEBUG_SNIPPETS_DIR, filename)
-    with open(path, "wb") as f:
-        f.write(data)
-    return path
-
-
-@log_call("playback")
-def probe_media(path: str) -> tuple[bool, str]:
-    """Run ffmpeg to probe the media file and return (ok, combined_output).
-
-    This runs `ffmpeg -v info -i <path> -f null -` and captures stderr/stdout
-    which ffmpeg prints to stderr. Returns True if ffmpeg exit code == 0.
-    """
-    try:
-        # ffmpeg prints info to stderr by default
-        proc = subprocess.run(["ffmpeg", "-v", "info", "-i", path, "-f", "null", "-"], capture_output=True, text=True, timeout=10)
-        out = proc.stdout + "\n" + proc.stderr
-        return (proc.returncode == 0, out)
-    except Exception as exc:
-        return (False, f"ffmpeg probe failed: {exc} \n{traceback.format_exc()}")
 
 # Static list of debug targets. Use these names with --debug or with individual
 # flags like --debug-voice, --debug-sinks, etc.
@@ -131,7 +114,6 @@ DEBUG_TARGETS = [
     "commands",
     "config",
     "rate_limit",
-    "storage",
 ]
 
 
@@ -145,11 +127,52 @@ def redact_config(cfg: dict) -> dict:
     return out
 
 
-
-
 def load_config(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+async def generate_tts_bytes(text: str) -> bytes:
+    """Generate TTS audio as bytes in-memory using `espeak-ng`.
+
+    This implementation does not write any files to disk. If `espeak-ng` is
+    not available or fails, the function returns an empty bytes object.
+    """
+    # Preferred path: espeak-ng -> stdout
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "espeak-ng",
+            "--stdout",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await proc.communicate(text.encode())
+        if proc.returncode == 0 and out:
+            return out
+        # Log stderr at debug level for troubleshooting
+        if err:
+            try:
+                logger.debug("espeak-ng stderr: %s", err.decode(errors="replace"))
+            except Exception:
+                logger.debug("espeak-ng stderr (binary)")
+    except FileNotFoundError:
+        # espeak-ng not installed
+        pass
+    except Exception:
+        pass
+    # If espeak-ng failed or is not present, return empty bytes (no disk IO)
+    logger.debug("espeak-ng not available or failed; skipping TTS")
+    return b""
+
+
+async def probe_tts() -> bool:
+    """Quick probe to check if TTS generation works at runtime."""
+    try:
+        data = await generate_tts_bytes("TTS probe")
+        return bool(data)
+    except Exception:
+        return False
 
 
 class RateLimitHandler:
@@ -166,18 +189,18 @@ class RateLimitHandler:
             await asyncio.sleep(wait_time)
         self.last_connect_time = time.time()
 
+
 rate_limiter = RateLimitHandler()
 
 
 class VoiceTestBot(commands.Bot):
     def __init__(self, config: dict):
         intents = discord.Intents.default()
+        # Require members and voice state intents for reliable member/voice data
+        intents.members = True
+        intents.voice_states = True
         super().__init__(command_prefix="!", intents=intents)
         self.config = config
-        # Hard-coded join sound path per project policy (not stored in config)
-        self.join_sound = "assets/join_sound.opus"
-        # Temporary placeholder for voice-test playback until real capture is implemented
-        self.placeholder_snippet = "assets/placeholder-voice-recording.opus"
         self.default_duration = config.get("default_duration", 5)
         self.max_duration = config.get("max_duration", 10)
         self.playback_delay = config.get("playback_delay", 1)
@@ -188,6 +211,9 @@ class VoiceTestBot(commands.Bot):
 
         # runtime debug targets (set by CLI args)
         self.debug_targets: set[str] = set()
+        # Optional behavior: automatically leave voice channels when alone
+        # Default to True for convenience; can be disabled via config.
+        self.auto_leave_when_alone = config.get("auto_leave_when_alone", True)
 
     def set_debug_targets(self, targets: set):
         self.debug_targets = set(targets or [])
@@ -206,20 +232,23 @@ class VoiceTestBot(commands.Bot):
 bot: VoiceTestBot | None = None
 
 
-async def on_ready():
-    logger.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
+
 
 
 @log_call("voice")
-async def ensure_voice_connected(ctx: discord.ApplicationContext | discord.Interaction) -> discord.VoiceClient | None:
+async def ensure_voice_connected(
+    ctx: discord.ApplicationContext | discord.Interaction,
+) -> discord.VoiceClient | None:
     # Ensure the bot is connected to the caller's voice channel
     user = getattr(ctx, "author", None) or getattr(ctx, "user", None)
     if not isinstance(user, discord.Member) or not user.voice or not user.voice.channel:
         respond = getattr(ctx, "respond", None)
         if not respond and hasattr(ctx, "response"):
-             respond = ctx.response.send_message
+            respond = ctx.response.send_message
         if respond:
-            await respond("You must be in a voice channel for this command.", ephemeral=True)
+            await respond(
+                "You must be in a voice channel for this command.", ephemeral=True
+            )
         return None
 
     channel = user.voice.channel
@@ -229,14 +258,17 @@ async def ensure_voice_connected(ctx: discord.ApplicationContext | discord.Inter
 
     try:
         if bot and bot.debug_enabled("voice"):
-            bot.debug("voice", f"Attempting to connect to voice channel id={channel.id} in guild={ctx.guild.id}")
-        
+            bot.debug(
+                "voice",
+                f"Attempting to connect to voice channel id={channel.id} in guild={ctx.guild.id}",
+            )
+
         await rate_limiter.wait_if_needed()
         voice_client = await channel.connect()
     except Exception as exc:
         respond = getattr(ctx, "respond", None)
         if not respond and hasattr(ctx, "response"):
-             respond = ctx.response.send_message
+            respond = ctx.response.send_message
         if respond:
             await respond(f"Failed to join voice channel: {exc}", ephemeral=True)
         return None
@@ -245,28 +277,49 @@ async def ensure_voice_connected(ctx: discord.ApplicationContext | discord.Inter
 
 
 @log_call("playback")
-async def play_join_sound(voice_client: discord.VoiceClient):
-    path = bot.join_sound if bot else None
-    if not path:
-        return
-    if not os.path.exists(path):
-        logger.warning(f"Join sound not found at {path}")
-        return
+async def play_join_sound(
+    voice_client: discord.VoiceClient, text_channel: discord.TextChannel = None
+):
+    # TTS Announcement
+    try:
+        data = await generate_tts_bytes(
+            "Voice tester has joined the channel. No recordings unless explicitly triggered by a user."
+        )
+        if data:
+            audio_source = io.BytesIO(data)
+            try:
+                audio_source.seek(0)
+            except Exception:
+                pass
+            voice_client.play(FFmpegPCMAudio(audio_source, pipe=True))
+            while voice_client.is_playing():
+                await asyncio.sleep(0.1)
+        else:
+            logger.debug(
+                "No TTS audio produced for join announcement; skipping voice playback"
+            )
+    except Exception as e:
+        logger.error(f"Join TTS failed: {e}")
 
-    if bot and bot.debug_enabled("playback"):
-        bot.debug("playback", f"Playing join sound from {path}")
-        # Probe the file with ffmpeg to show codec/format info for debugging
-        ok, out = probe_media(path)
-        bot.debug("playback", f"ffmpeg probe ok={ok} output:\n{out}")
-    source = FFmpegPCMAudio(path)
-    voice_client.play(source)
-    # wait until playback completes
-    while voice_client.is_playing():
-        await asyncio.sleep(0.1)
+    # Text Summary
+    if text_channel:
+        try:
+            await text_channel.send(
+                "**Voice Tester Bot**\n"
+                "This bot is a privacy-focused tool for testing your microphone quality.\n"
+                "• It **only** records when you explicitly run `/voicetest` or click the **Test** button.\n"
+                "• It **only** records the user who triggered the command.\n"
+                "• Audio is stored **in-memory only** and is deleted immediately after playback.\n"
+                "• No data is sent to external servers."
+            )
+        except Exception as e:
+            logger.error(f"Failed to send text summary: {e}")
 
 
 @log_call("sinks")
-async def record_user_audio(guild: discord.Guild, user: discord.User, duration: int) -> bytes:
+async def record_user_audio(
+    guild: discord.Guild, user: discord.User, duration: int
+) -> bytes:
     """
     Capture `user`'s audio for `duration` seconds using py-cord's native voice receive.
     Returns raw OGG bytes (Opus encoded).
@@ -276,12 +329,23 @@ async def record_user_audio(guild: discord.Guild, user: discord.User, duration: 
         raise RuntimeError("Bot is not connected to a voice channel in this guild")
 
     if bot and bot.debug_enabled("sinks"):
-        bot.debug("sinks", f"Using py-cord native OGGSink")
+        bot.debug("sinks", "Using py-cord native OGGSink")
 
     sink = discord.sinks.OGGSink()
 
-    async def finished_callback(sink, *args):
-        pass
+    # Use a future that the finished_callback will set when sink is flushed.
+    loop = asyncio.get_running_loop()
+    finished_future = loop.create_future()
+
+    def finished_callback(sink_obj, *args):
+        try:
+            if not finished_future.done():
+                finished_future.set_result(True)
+        except Exception:
+            try:
+                finished_future.set_result(False)
+            except Exception:
+                pass
 
     # Start recording
     try:
@@ -289,23 +353,31 @@ async def record_user_audio(guild: discord.Guild, user: discord.User, duration: 
         # if the resulting audio is intelligible.
         vc.start_recording(sink, finished_callback)
         if bot and bot.debug_enabled("sinks"):
-            bot.debug("sinks", f"Started recording for duration={duration}s on guild={guild.id}")
+            bot.debug(
+                "sinks",
+                f"Started recording for duration={duration}s on guild={guild.id}",
+            )
     except Exception as exc:
         if bot and bot.debug_enabled("sinks"):
-            bot.debug("sinks", f"start_recording threw: {exc}\n{traceback.format_exc()}")
+            bot.debug(
+                "sinks", f"start_recording threw: {exc}\n{traceback.format_exc()}"
+            )
         raise RuntimeError("Failed to start recording on VoiceClient") from exc
 
     # Wait for the requested duration
     await asyncio.sleep(duration)
 
-    # Stop recording
+    # Stop recording and wait for the sink's finished callback to fire.
     try:
         vc.stop_recording()
     except Exception:
         pass
 
-    # Small delay to allow sink to flush
-    await asyncio.sleep(0.2)
+    try:
+        await asyncio.wait_for(finished_future, timeout=2.0)
+    except asyncio.TimeoutError:
+        if bot and bot.debug_enabled("sinks"):
+            bot.debug("sinks", "OGGSink finished callback timed out; continuing")
 
     # Extract audio
     # py-cord's OGGSink stores data in sink.audio_data[user_id] which is an AudioData object
@@ -315,15 +387,18 @@ async def record_user_audio(guild: discord.Guild, user: discord.User, duration: 
         # user_id is int
         audio_data = sink.audio_data.get(user.id)
         if not audio_data:
-             # Try string key just in case
-             audio_data = sink.audio_data.get(str(user.id))
-        
+            # Try string key just in case
+            audio_data = sink.audio_data.get(str(user.id))
+
         if not audio_data:
-             # If user didn't speak, we might not have data.
-             # Check if we have ANY data to debug
-             if bot and bot.debug_enabled("sinks"):
-                 bot.debug("sinks", f"No audio data for user {user.id}. Available keys: {list(sink.audio_data.keys())}")
-             raise RuntimeError(f"No audio recorded for user {user.id}")
+            # If user didn't speak, we might not have data.
+            # Check if we have ANY data to debug
+            if bot and bot.debug_enabled("sinks"):
+                bot.debug(
+                    "sinks",
+                    f"No audio data for user {user.id}. Available keys: {list(sink.audio_data.keys())}",
+                )
+            raise RuntimeError(f"No audio recorded for user {user.id}")
 
         # AudioData.file is the BytesIO
         audio_bytes = audio_data.file.getvalue()
@@ -331,11 +406,10 @@ async def record_user_audio(guild: discord.Guild, user: discord.User, duration: 
 
     except Exception as exc:
         if bot and bot.debug_enabled("sinks"):
-             bot.debug("sinks", f"Error extracting audio: {exc}")
+            bot.debug("sinks", f"Error extracting audio: {exc}")
         raise
 
 
-@staticmethod
 def _ensure_duration(dur: int, default: int, maximum: int) -> int:
     if dur is None:
         return default
@@ -348,59 +422,285 @@ def _ensure_duration(dur: int, default: int, maximum: int) -> int:
     return min(d, maximum)
 
 
-async def on_app_command_error(interaction: discord.Interaction, error: Exception):
-    # Basic error handler for application commands
-    try:
-        await interaction.response.send_message(f"Error: {error}", ephemeral=True)
-    except Exception:
-        pass
+# on_app_command_error is registered inside `main()` where `bot` exists.
+
+
+class VoiceTestView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Join", style=discord.ButtonStyle.primary, custom_id="voicetest_join_btn"
+    )
+    async def join_button(
+        self, button: discord.ui.Button, interaction: discord.Interaction
+    ):
+        vc = await ensure_voice_connected(interaction)
+        if vc:
+            await interaction.response.send_message(
+                "Joined voice channel.", ephemeral=True
+            )
+            # Try to get the channel where the interaction happened
+            channel = interaction.channel if hasattr(interaction, "channel") else None
+            await play_join_sound(vc, text_channel=channel)
+
+    @discord.ui.button(
+        label="Leave", style=discord.ButtonStyle.danger, custom_id="voicetest_leave_btn"
+    )
+    async def leave_button(
+        self, button: discord.ui.Button, interaction: discord.Interaction
+    ):
+        vc = interaction.guild.voice_client
+        if vc:
+            await vc.disconnect()
+            await interaction.response.send_message(
+                "Left voice channel.", ephemeral=True
+            )
+        else:
+            await interaction.response.send_message("Not connected.", ephemeral=True)
+
+    @discord.ui.button(
+        label="Test", style=discord.ButtonStyle.success, custom_id="voicetest_test_btn"
+    )
+    async def test_button(
+        self, button: discord.ui.Button, interaction: discord.Interaction
+    ):
+        # Only allow pressing user to run test for themselves
+        dur = bot.default_duration if bot else 5
+        await run_voice_test(interaction, interaction.user, dur)
 
 
 def create_views():
-    class VoiceTestView(discord.ui.View):
-        def __init__(self):
-            super().__init__(timeout=None)
+    return VoiceTestView()
 
-        @discord.ui.button(label="Join", style=discord.ButtonStyle.primary)
-        async def join_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-            vc = await ensure_voice_connected(interaction)
-            if vc:
-                await interaction.response.send_message("Joined voice channel.", ephemeral=True)
-                await play_join_sound(vc)
 
-        @discord.ui.button(label="Leave", style=discord.ButtonStyle.danger)
-        async def leave_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-            vc = interaction.guild.voice_client
-            if vc:
-                await vc.disconnect()
-                await interaction.response.send_message("Left voice channel.", ephemeral=True)
+async def run_voice_test(
+    interaction: discord.Interaction | discord.ApplicationContext,
+    user: discord.Member,
+    duration: int,
+):
+    """Common logic for running a voice test from slash command or button."""
+
+    # Helper to handle response differences
+    async def send_msg(msg, ephemeral=True):
+        if hasattr(interaction, "respond"):
+            await interaction.respond(msg, ephemeral=ephemeral)
+        elif hasattr(interaction, "response"):
+            if not interaction.response.is_done():
+                await interaction.response.send_message(msg, ephemeral=ephemeral)
             else:
-                await interaction.response.send_message("Not connected.", ephemeral=True)
+                await interaction.followup.send(msg, ephemeral=ephemeral)
+        else:
+            # Fallback
+            pass
 
-        @discord.ui.button(label="Test", style=discord.ButtonStyle.success)
-        async def test_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-            # Only allow pressing user to run test for themselves
-            await interaction.response.send_message("Triggering voice test...", ephemeral=True)
-            # Forward to the same flow as /voicetest
-            # We call the slash command handler directly via the bot's tree
+    async def send_channel(msg):
+        if hasattr(interaction, "channel") and interaction.channel:
+            await interaction.channel.send(msg)
+        elif (
+            hasattr(interaction, "message")
+            and interaction.message
+            and interaction.message.channel
+        ):
+            await interaction.message.channel.send(msg)
+
+    guild = interaction.guild
+    if not guild:
+        await send_msg("This command must be used in a guild.")
+        return
+
+    # Check membership and channel
+    if not isinstance(user, discord.Member) or not user.voice or not user.voice.channel:
+        await send_msg("You must be in a voice channel to run a voice test.")
+        return
+
+    guild_id = guild.id
+    if bot._active_recordings.get(guild_id):
+        await send_msg(
+            "A recording is already in progress in this guild. Try again later."
+        )
+        return
+
+    vc = await ensure_voice_connected(interaction)
+    if not vc:
+        return
+
+    # Announce and play a short cue
+    await send_msg(
+        f"Starting voice test for {duration}s. You will be recorded and then played back."
+    )
+    await send_channel(f"{user.display_name} is starting a voice test for {duration}s.")
+
+    # TTS: Announce start
+    try:
+        # Instead of relying solely on the startup probe, attempt to generate
+        # TTS now and treat generation success as the source-of-truth. This
+        # avoids false negatives where the probe failed earlier but runtime
+        # generation still works.
+        if bot and bot.debug_enabled("playback"):
+            bot.debug("playback", "Attempting start announcement TTS generation")
+
+        data = await generate_tts_bytes(f"Recording starting for {user.display_name}")
+        if not data:
+            await send_msg(
+                "Voice announcement unavailable; cannot proceed with recording for privacy reasons.",
+                ephemeral=True,
+            )
+            await send_channel("Voice test aborted: audible announcement unavailable.")
+            return
+
+        audio_source = io.BytesIO(data)
+        try:
+            audio_source.seek(0)
+        except Exception:
+            pass
+        vc.play(FFmpegPCMAudio(audio_source, pipe=True))
+        while vc.is_playing():
+            await asyncio.sleep(0.1)
+    except Exception as e:
+        logger.error(f"TTS generation failed: {e}")
+        await send_msg("TTS error occurred; aborting voice test.", ephemeral=True)
+        await send_channel("Voice test aborted: TTS error during start announcement.")
+        return
+
+    try:
+        bot._active_recordings[guild_id] = user.id
+        # Attempt live record via sinks
+        try:
+            if bot and bot.debug_enabled("commands"):
+                bot.debug(
+                    "commands",
+                    f"Starting live capture for user={user.id} dur={duration}",
+                )
+
+            audio_bytes = await record_user_audio(guild, user, duration)
+
+            # TTS: Announce stop
             try:
-                # There is no public API to invoke app command handlers directly here;
-                # rely on the user calling /voicetest or add specialized logic.
-                await interaction.followup.send("Please use /voicetest to run the test (button scaffold).", ephemeral=True)
+                data = await generate_tts_bytes("Recording stopped. Playing back.")
+                if data:
+                    audio_source = io.BytesIO(data)
+                    try:
+                        audio_source.seek(0)
+                    except Exception:
+                        pass
+                    vc.play(FFmpegPCMAudio(audio_source, pipe=True))
+                    while vc.is_playing():
+                        await asyncio.sleep(0.1)
+                else:
+                    logger.debug(
+                        "No TTS audio produced for stop announcement; skipping voice playback"
+                    )
+            except Exception as e:
+                logger.error(f"TTS generation failed: {e}")
+
+            await send_channel("Recording complete. Waiting briefly before playback...")
+            await asyncio.sleep(bot.playback_delay)
+
+            # Playback from memory
+            audio_source = io.BytesIO(audio_bytes)
+            try:
+                audio_source.seek(0)
             except Exception:
                 pass
+            # FFmpegPCMAudio with pipe=True reads from the file-like object
+            vc.play(FFmpegPCMAudio(audio_source, pipe=True))
 
-    return VoiceTestView()
+            await send_channel("Playing back recorded audio.")
+            while vc.is_playing():
+                await asyncio.sleep(0.1)
+
+            await send_channel("Playback complete.")
+        except Exception as exc:
+            # If recording isn't supported or errors, fall back to placeholder snippet
+            if bot and bot.debug_enabled("sinks"):
+                bot.debug("sinks", f"record_user_audio failed: {exc}")
+            await send_channel(f"Recording failed: {exc}")
+    finally:
+        bot._active_recordings.pop(guild_id, None)
+
+
+async def cleanup_and_shutdown(bot_obj, sig_name: str | int = None):
+    """Module-level cleanup routine to stop recordings, disconnect VCs,
+    clear active recording state, and close the bot. Separated from
+    `main()` so it can be tested directly.
+    """
+    logger.info(
+        f"Shutdown requested ({sig_name}); cleaning up voice clients and recordings"
+    )
+    try:
+        # Stop any active recordings by attempting to stop recording on each VC
+        for guild in list(getattr(bot_obj, "guilds", [])):
+            try:
+                vc = getattr(guild, "voice_client", None)
+                if vc:
+                    try:
+                        # If the voice client is recording via sinks, stop it
+                        try:
+                            vc.stop_recording()
+                        except Exception:
+                            pass
+                        # Disconnect the voice client
+                        try:
+                            # Support both sync and async disconnect APIs
+                            disc = vc.disconnect
+                            if asyncio.iscoroutinefunction(disc):
+                                await disc()
+                            else:
+                                disc()
+                        except Exception:
+                            logger.debug(
+                                f"Failed to disconnect vc for guild {getattr(guild, 'id', None)}"
+                            )
+                    except Exception:
+                        logger.debug(
+                            f"Failed to disconnect vc for guild {getattr(guild, 'id', None)}"
+                        )
+            except Exception:
+                logger.debug(f"Error while cleaning guild {getattr(guild, 'id', None)}")
+
+        # Clear active recording state
+        try:
+            if hasattr(bot_obj, "_active_recordings"):
+                bot_obj._active_recordings.clear()
+        except Exception:
+            pass
+    except Exception:
+        logger.exception("Error during cleanup")
+    finally:
+        try:
+            # Attempt to close the bot if it provides an async close
+            close_fn = getattr(bot_obj, "close", None)
+            if close_fn:
+                if asyncio.iscoroutinefunction(close_fn):
+                    await close_fn()
+                else:
+                    close_fn()
+        except Exception:
+            pass
 
 
 def main():
     parser = argparse.ArgumentParser(description="Discord Sound Test bot (prototype)")
-    parser.add_argument("--config", required=True, help="Path to JSON config file (no env vars).")
-    parser.add_argument("--debug", action="append", choices=DEBUG_TARGETS, help="Enable debugging for a target (can be passed multiple times).")
-    parser.add_argument("--debug-all", action="store_true", help="Enable all debug targets.")
+    parser.add_argument(
+        "--config", required=True, help="Path to JSON config file (no env vars)."
+    )
+    parser.add_argument(
+        "--debug",
+        action="append",
+        choices=DEBUG_TARGETS,
+        help="Enable debugging for a target (can be passed multiple times).",
+    )
+    parser.add_argument(
+        "--debug-all", action="store_true", help="Enable all debug targets."
+    )
     # individual debug flags for convenience
     for t in DEBUG_TARGETS:
-        parser.add_argument(f"--debug-{t.replace('_', '-')}", action="store_true", help=f"Enable debug target: {t}")
+        parser.add_argument(
+            f"--debug-{t.replace('_', '-')}",
+            action="store_true",
+            help=f"Enable debug target: {t}",
+        )
     args = parser.parse_args()
 
     config_path = args.config
@@ -412,6 +712,30 @@ def main():
 
     global bot
     bot = VoiceTestBot(config)
+
+    # Register graceful shutdown handlers to ensure we don't leave recordings
+    # or voice clients open on SIGINT/SIGTERM. We schedule an async cleanup
+    # task that will attempt to stop any recordings and disconnect voice clients.
+    loop = asyncio.get_event_loop()
+
+    async def _cleanup_and_shutdown(sig_name: str | int = None):
+        # Delegate to module-level cleanup so logic is testable and centralized
+        await cleanup_and_shutdown(bot, sig_name)
+
+    def _register_signal_handlers():
+        async def _on_signal(sig):
+            await _cleanup_and_shutdown(sig)
+
+        for s in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(
+                    s, lambda s=s: asyncio.create_task(_on_signal(s))
+                )
+            except NotImplementedError:
+                # Event loop does not support add_signal_handler (e.g., on Windows), ignore
+                pass
+
+    _register_signal_handlers()
 
     # Configure debug targets on the bot
     selected: set[str] = set()
@@ -429,18 +753,98 @@ def main():
     logger.debug("startup completed preliminary setup")
 
     @bot.event
-    async def on_ready_event():
+    async def on_ready():
         logger.info(f"Bot ready: {bot.user} ({bot.user.id})")
+        # Probe TTS at startup so we can enforce audible consent for recordings
+        try:
+            ok = await probe_tts()
+            bot.tts_available = ok
+            if ok:
+                logger.info("TTS probe succeeded; in-voice announcements enabled")
+            else:
+                logger.warning("TTS probe failed; voice announcements will be disabled")
+        except Exception:
+            bot.tts_available = False
+            logger.exception("TTS probe raised an exception")
+        bot.add_view(VoiceTestView())
+
+        # Ensure application commands are synchronized with Discord's API.
+        try:
+            logger.info("Attempting global command sync...")
+            await bot.sync_commands()
+            logger.info("Global command sync complete.")
+        except Exception:
+            logger.exception("Command sync failed on startup. Exiting.")
+            sys.exit(1)
+
+    @bot.event
+    async def on_app_command_error(interaction: discord.Interaction, error: Exception):
+        # Basic error handler for application commands
+        try:
+            await interaction.response.send_message(f"Error: {error}", ephemeral=True)
+        except Exception:
+            pass
+    @bot.event
+    async def on_voice_state_update(member: discord.Member, before, after):
+        """Auto-disconnect when no non-bot users remain in the voice channel.
+
+        This schedules a short delayed re-check to avoid races when users
+        briefly switch channels.
+        """
+        try:
+            guild = getattr(member, "guild", None)
+            if not guild:
+                return
+
+            guild_id = guild.id
+            # Respect configured option: if disabled, do not auto-disconnect
+            if not getattr(bot, "auto_leave_when_alone", True):
+                return
+
+            # If a recording is active, do not auto-disconnect
+            if getattr(bot, "_active_recordings", {}).get(guild_id):
+                return
+
+            vc = guild.voice_client
+            if not vc or not getattr(vc, "channel", None):
+                return
+
+            channel = vc.channel
+
+            async def _delayed_check():
+                await asyncio.sleep(5)
+                # If a recording started meanwhile, abort
+                if getattr(bot, "_active_recordings", {}).get(guild_id):
+                    return
+                # Re-evaluate members in the channel
+                non_bots = [m for m in channel.members if not getattr(m, "bot", False)]
+                if len(non_bots) == 0:
+                    try:
+                        await vc.disconnect()
+                        logger.info(
+                            f"Auto-disconnect: left voice channel in guild {guild_id} (no non-bot users)"
+                        )
+                    except Exception:
+                        logger.debug(
+                            f"Auto-disconnect failed for guild {guild_id}: {traceback.format_exc()}"
+                        )
+
+            asyncio.create_task(_delayed_check())
+        except Exception:
+            logger.exception("on_voice_state_update handler error")
 
     @bot.slash_command(name="join")
     async def join_command(ctx: discord.ApplicationContext):
         if bot and bot.debug_enabled("commands"):
-            bot.debug("commands", f"/join invoked by user={ctx.author.id} in guild={ctx.guild.id}")
+            bot.debug(
+                "commands",
+                f"/join invoked by user={ctx.author.id} in guild={ctx.guild.id}",
+            )
         vc = await ensure_voice_connected(ctx)
         if not vc:
             return
-        await ctx.respond("Joined voice channel and playing join sound.", ephemeral=True)
-        await play_join_sound(vc)
+        await ctx.respond("Joined voice channel.", ephemeral=True)
+        await play_join_sound(vc, text_channel=ctx.channel)
 
     @bot.slash_command(name="leave")
     async def leave_command(ctx: discord.ApplicationContext):
@@ -454,65 +858,13 @@ def main():
     @bot.slash_command(name="voicetest")
     async def voicetest_command(ctx: discord.ApplicationContext, duration: int = None):
         if bot and bot.debug_enabled("commands"):
-            bot.debug("commands", f"/voicetest invoked by user={ctx.author.id} duration={duration}")
-        # Enforce user-only trigger by design: ctx.author must be the target
+            bot.debug(
+                "commands",
+                f"/voicetest invoked by user={ctx.author.id} duration={duration}",
+            )
+
         dur = _ensure_duration(duration, bot.default_duration, bot.max_duration)
-
-        # Check membership and channel
-        if not isinstance(ctx.author, discord.Member) or not ctx.author.voice or not ctx.author.voice.channel:
-            await ctx.respond("You must be in a voice channel to run a voice test.", ephemeral=True)
-            return
-
-        guild_id = ctx.guild.id
-        if bot._active_recordings.get(guild_id):
-            await ctx.respond("A recording is already in progress in this guild. Try again later.", ephemeral=True)
-            return
-
-        vc = await ensure_voice_connected(ctx)
-        if not vc:
-            return
-
-        # Announce and play a short cue
-        await ctx.respond(f"Starting voice test for {dur}s. You will be recorded and then played back.", ephemeral=True)
-        await ctx.channel.send(f"{ctx.author.display_name} is starting a voice test for {dur}s.")
-
-        try:
-            bot._active_recordings[guild_id] = ctx.author.id
-            # Attempt live record via sinks; record_user_audio will raise if not supported
-            try:
-                if bot and bot.debug_enabled("commands"):
-                    bot.debug("commands", f"Starting live capture for user={ctx.author.id} dur={dur}")
-                audio_bytes = await record_user_audio(ctx.guild, ctx.author, dur)
-
-                # Save for debugging (separate function for easy removal later)
-                snippet_path = save_debug_snippet(audio_bytes, ctx.guild, ctx.author)
-                if bot and bot.debug_enabled("storage"):
-                    bot.debug("storage", f"Saved debug snippet to {snippet_path}")
-
-                await ctx.channel.send("Recording complete. Waiting briefly before playback...")
-                await asyncio.sleep(bot.playback_delay)
-
-                # Playback the saved file
-                vc.play(FFmpegPCMAudio(snippet_path))
-                await ctx.channel.send(f"Playing back recorded snippet from `{snippet_path}`.")
-                while vc.is_playing():
-                    await asyncio.sleep(0.1)
-
-                await ctx.channel.send("Playback complete. Debug file retained for inspection.")
-            except Exception as exc:
-                # If recording isn't supported or errors, fall back to placeholder snippet
-                if bot and bot.debug_enabled("sinks"):
-                    bot.debug("sinks", f"record_user_audio failed: {exc}")
-                placeholder = bot.placeholder_snippet if bot else None
-                if placeholder and os.path.exists(placeholder):
-                    vc.play(FFmpegPCMAudio(placeholder))
-                    await ctx.channel.send("Recording failed; playing placeholder snippet instead.")
-                    while vc.is_playing():
-                        await asyncio.sleep(0.1)
-                else:
-                    await ctx.channel.send(f"Recording failed and no placeholder available: {exc}")
-        finally:
-            bot._active_recordings.pop(guild_id, None)
+        await run_voice_test(ctx, ctx.author, dur)
 
     @bot.slash_command(name="postvoicetestcommands")
     async def post_commands(ctx: discord.ApplicationContext):
@@ -531,10 +883,6 @@ def main():
             await ctx.respond("No active recording found for you.", ephemeral=True)
 
     # Basic startup checks
-    if bot.join_sound and not Path(bot.join_sound).exists():
-        logger.error(f"Required join sound not found at: {bot.join_sound}")
-        sys.exit(2)
-
     token = config.get("token")
     if not token:
         logger.error("Config must include 'token' field. No env vars are used.")
