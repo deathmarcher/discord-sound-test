@@ -48,63 +48,6 @@ if not logger.handlers:
 bot = None
 
 
-# log_call decorator: logs entry/args/exceptions when its debug target is enabled
-def log_call(target: str):
-    """Decorator to log function entry/args to the bot debug system for `target`.
-
-    It works for both sync and async functions. Logging is performed at call
-    time so `bot` can be set after module import.
-    """
-
-    def decorator(func):
-        @functools.wraps(func)
-        async def async_wrapper(*args, **kwargs):
-            try:
-                if bot and getattr(bot, "debug", None) and bot.debug_enabled(target):
-                    try:
-                        bot.debug(
-                            target, f"CALL {func.__name__} args={args} kwargs={kwargs}"
-                        )
-                    except Exception:
-                        logger.warning(
-                            f"[DEBUG:{target}] failed to format args for {func.__name__}"
-                        )
-                return await func(*args, **kwargs)
-            except Exception:
-                # Log exception details
-                if bot and getattr(bot, "debug", None) and bot.debug_enabled(target):
-                    bot.debug(
-                        target,
-                        f"EXCEPTION in {func.__name__}: {traceback.format_exc()}",
-                    )
-                raise
-
-        @functools.wraps(func)
-        def sync_wrapper(*args, **kwargs):
-            try:
-                if bot and getattr(bot, "debug", None) and bot.debug_enabled(target):
-                    try:
-                        bot.debug(
-                            target, f"CALL {func.__name__} args={args} kwargs={kwargs}"
-                        )
-                    except Exception:
-                        logger.warning(
-                            f"[DEBUG:{target}] failed to format args for {func.__name__}"
-                        )
-                return func(*args, **kwargs)
-            except Exception:
-                if bot and getattr(bot, "debug", None) and bot.debug_enabled(target):
-                    bot.debug(
-                        target,
-                        f"EXCEPTION in {func.__name__}: {traceback.format_exc()}",
-                    )
-                raise
-
-        return async_wrapper if inspect.iscoroutinefunction(func) else sync_wrapper
-
-    return decorator
-
-
 # Static list of debug targets. Use these names with --debug or with individual
 # flags like --debug-voice, --debug-sinks, etc.
 DEBUG_TARGETS = [
@@ -232,10 +175,6 @@ class VoiceTestBot(commands.Bot):
 bot: VoiceTestBot | None = None
 
 
-
-
-
-@log_call("voice")
 async def ensure_voice_connected(
     ctx: discord.ApplicationContext | discord.Interaction,
 ) -> discord.VoiceClient | None:
@@ -276,7 +215,6 @@ async def ensure_voice_connected(
     return voice_client
 
 
-@log_call("playback")
 async def play_join_sound(
     voice_client: discord.VoiceClient, text_channel: discord.TextChannel = None
 ):
@@ -316,7 +254,6 @@ async def play_join_sound(
             logger.error(f"Failed to send text summary: {e}")
 
 
-@log_call("sinks")
 async def record_user_audio(
     guild: discord.Guild, user: discord.User, duration: int
 ) -> bytes:
@@ -337,7 +274,7 @@ async def record_user_audio(
     loop = asyncio.get_running_loop()
     finished_future = loop.create_future()
 
-    def finished_callback(sink_obj, *args):
+    async def finished_callback(sink_obj, *args):
         try:
             if not finished_future.done():
                 finished_future.set_result(True)
@@ -351,6 +288,9 @@ async def record_user_audio(
     try:
         # Note: Opus decoding errors in logs are common with UDP voice traffic and can often be ignored
         # if the resulting audio is intelligible.
+        if not vc.is_connected():
+            raise RuntimeError("Voice client disconnected before recording")
+
         vc.start_recording(sink, finished_callback)
         if bot and bot.debug_enabled("sinks"):
             bot.debug(
@@ -364,8 +304,13 @@ async def record_user_audio(
             )
         raise RuntimeError("Failed to start recording on VoiceClient") from exc
 
-    # Wait for the requested duration
-    await asyncio.sleep(duration)
+    # Wait for the requested duration, checking connection periodically
+    for _ in range(int(duration * 10)):
+        if not vc.is_connected():
+            if bot and bot.debug_enabled("sinks"):
+                bot.debug("sinks", "Voice client disconnected during recording wait")
+            break
+        await asyncio.sleep(0.1)
 
     # Stop recording and wait for the sink's finished callback to fire.
     try:
@@ -525,6 +470,29 @@ async def run_voice_test(
     if not vc:
         return
 
+    # Helper to safely play audio
+    async def safe_play(data_or_bytesio):
+        if not vc.is_connected():
+            return
+        try:
+            if isinstance(data_or_bytesio, bytes):
+                source = io.BytesIO(data_or_bytesio)
+            else:
+                source = data_or_bytesio
+            
+            try:
+                source.seek(0)
+            except Exception:
+                pass
+                
+            vc.play(FFmpegPCMAudio(source, pipe=True))
+            while vc.is_playing():
+                await asyncio.sleep(0.1)
+                if not vc.is_connected():
+                    break
+        except Exception as e:
+            logger.warning(f"Playback error: {e}")
+
     # Announce and play a short cue
     await send_msg(
         f"Starting voice test for {duration}s. You will be recorded and then played back."
@@ -549,14 +517,7 @@ async def run_voice_test(
             await send_channel("Voice test aborted: audible announcement unavailable.")
             return
 
-        audio_source = io.BytesIO(data)
-        try:
-            audio_source.seek(0)
-        except Exception:
-            pass
-        vc.play(FFmpegPCMAudio(audio_source, pipe=True))
-        while vc.is_playing():
-            await asyncio.sleep(0.1)
+        await safe_play(data)
     except Exception as e:
         logger.error(f"TTS generation failed: {e}")
         await send_msg("TTS error occurred; aborting voice test.", ephemeral=True)
@@ -579,14 +540,7 @@ async def run_voice_test(
             try:
                 data = await generate_tts_bytes("Recording stopped. Playing back.")
                 if data:
-                    audio_source = io.BytesIO(data)
-                    try:
-                        audio_source.seek(0)
-                    except Exception:
-                        pass
-                    vc.play(FFmpegPCMAudio(audio_source, pipe=True))
-                    while vc.is_playing():
-                        await asyncio.sleep(0.1)
+                    await safe_play(data)
                 else:
                     logger.debug(
                         "No TTS audio produced for stop announcement; skipping voice playback"
@@ -599,16 +553,9 @@ async def run_voice_test(
 
             # Playback from memory
             audio_source = io.BytesIO(audio_bytes)
-            try:
-                audio_source.seek(0)
-            except Exception:
-                pass
             # FFmpegPCMAudio with pipe=True reads from the file-like object
-            vc.play(FFmpegPCMAudio(audio_source, pipe=True))
-
             await send_channel("Playing back recorded audio.")
-            while vc.is_playing():
-                await asyncio.sleep(0.1)
+            await safe_play(audio_source)
 
             await send_channel("Playback complete.")
         except Exception as exc:
