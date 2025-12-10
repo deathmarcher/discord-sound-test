@@ -1,0 +1,20 @@
+version: "3.8"
+
+services:
+  discord_sound_test:
+    build: .
+    image: discord-sound-test:latest
+    container_name: discord_sound_test
+    restart: unless-stopped
+    # Mount a runtime config.json into the container. THIS MUST BE PROVIDED
+    # by the operator; do NOT commit a config.json to the repository.
+    volumes:
+      - ./config.json:/app/config.json:ro
+    # Pass the required --config argument (entrypoint is `python bot.py`)
+    command: ["--config", "/app/config.json"]
+    # Optional: if you need host audio devices available for testing,
+    # uncomment the devices mapping below (Linux only):
+    # devices:
+    #   - /dev/snd:/dev/snd
+    environment:
+      - TZ=UTC
