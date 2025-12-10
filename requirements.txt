@@ -1,4 +1,6 @@
-py-cord[voice]
+py-cord[voice]>=2.0
 PyNaCl
 aiofiles
 soundfile
+# System deps: ffmpeg, espeak-ng (install via system package manager)
+
