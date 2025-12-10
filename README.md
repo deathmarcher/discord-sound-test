@@ -1,23 +1,26 @@
 # Discord Sound Test
 
-Prototype scaffold for a privacy-first Discord bot that performs short, single-user voice tests.
+Privacy-first Discord voice test prototype that performs short, single-user voice tests.
 
 Quick start (after editing `config.json`):
 
-1. Create and activate a virtualenv in the project root:
+1. Create and activate a virtualenv in the project root and install Python deps:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+
+# (Optional) Install development and test dependencies:
+pip install -r requirements-dev.txt
 ```
 
-2. Copy `config.example.json` to `config.json` and fill in your bot `token` and `join_sound` path.
+2. Copy `config.example.json` to `config.json` and fill in your bot `token`.
 
-3. Run the bot via the wrapper 
+3. Run the bot directly:
 
 ```bash
-./run.sh
+python3 bot.py --config config.json
 ```
 
 Discord bot setup and permissions
@@ -43,6 +46,10 @@ Security reminder
  - The project intentionally stores the bot token in `config.json` (no env vars). Treat `config.json` as a secret file: do not commit it to source control, and restrict access to it.
 
 Notes:
-- This scaffold intentionally does not use environment variables; the bot token must be supplied inside the JSON config file passed via `--config`.
-- `bot.py` contains TODOs for implementing an actual receive/capture pipeline; pick a discord voice library or fork that supports receive.
- 
+- This project intentionally does not use environment variables; the bot token must be supplied inside the JSON config file passed via `--config`.
+- `bot.py` is the canonical implementation for the prototype's voice flows; it uses in-memory capture and playback and documents areas where production hardening or alternate receive implementations may be desired.
+
+System dependencies
+- `ffmpeg` (used for playback)
+- `espeak-ng` (or `espeak`) — used for local, in-memory TTS generation
+
