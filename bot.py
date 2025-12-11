@@ -26,8 +26,7 @@ from discord import FFmpegPCMAudio
 from discord.ext import commands
 import time
 import traceback
-import functools
-import inspect
+
 import logging
 import signal
 
@@ -38,7 +37,7 @@ if not logger.handlers:
     handler = logging.StreamHandler(stream=sys.stdout)
     handler.setLevel(logging.DEBUG)
     fmt = logging.Formatter(
-        "aaaa [%(levelname)s:%(name)s] %(asctime)s %(message)s", "%Y-%m-%d %H:%M:%S"
+        "[%(levelname)s:%(name)s] %(asctime)s %(message)s", "%Y-%m-%d %H:%M:%S"
     )
     handler.setFormatter(fmt)
     logger.addHandler(handler)
@@ -56,7 +55,6 @@ DEBUG_TARGETS = [
     "playback",
     "commands",
     "config",
-    "rate_limit",
 ]
 
 
@@ -202,8 +200,36 @@ async def ensure_voice_connected(
                 f"Attempting to connect to voice channel id={channel.id} in guild={ctx.guild.id}",
             )
 
-        await rate_limiter.wait_if_needed()
-        voice_client = await channel.connect()
+        try:
+            await rate_limiter.wait_if_needed()
+            voice_client = await channel.connect()
+        except Exception as exc:
+            # Detailed diagnostics to help root-cause intermittent library errors
+            tb = traceback.format_exc()
+            logger.error(
+                "Voice connect raised %s: %s\nTraceback:\n%s",
+                type(exc).__name__,
+                exc,
+                tb,
+            )
+
+            # Log some helpful context about guild and channel state
+            try:
+                guild_ctx = ctx.guild
+                vc_list = getattr(guild_ctx, "voice_channels", None)
+                vc_ids = [getattr(c, "id", None) for c in vc_list] if vc_list else None
+                logger.error(
+                    "Guild id=%s shard_id=%s channels=%s voice_channels_ids=%s",
+                    getattr(guild_ctx, "id", None),
+                    getattr(guild_ctx, "shard_id", None),
+                    len(getattr(guild_ctx, "channels", [])),
+                    vc_ids,
+                )
+            except Exception:
+                logger.debug("Failed to log guild/channel diagnostics: %s", traceback.format_exc())
+
+            # Re-raise so the outer handler can respond to the user
+            raise
     except Exception as exc:
         respond = getattr(ctx, "respond", None)
         if not respond and hasattr(ctx, "response"):
@@ -229,9 +255,24 @@ async def play_join_sound(
                 audio_source.seek(0)
             except Exception:
                 pass
-            voice_client.play(FFmpegPCMAudio(audio_source, pipe=True))
-            while voice_client.is_playing():
+            # Wait until the voice client reports it's connected before playing
+            for _ in range(50):
+                try:
+                    if getattr(voice_client, "is_connected", None) and voice_client.is_connected():
+                        break
+                except Exception:
+                    pass
                 await asyncio.sleep(0.1)
+
+            try:
+                voice_client.play(FFmpegPCMAudio(audio_source, pipe=True))
+                while voice_client.is_playing():
+                    await asyncio.sleep(0.1)
+                    # Abort if client is disconnected during playback
+                    if getattr(voice_client, "is_connected", None) and not voice_client.is_connected():
+                        break
+            except Exception as play_exc:
+                logger.error(f"Playback failed: {play_exc}")
         else:
             logger.debug(
                 "No TTS audio produced for join announcement; skipping voice playback"
@@ -242,14 +283,23 @@ async def play_join_sound(
     # Text Summary
     if text_channel:
         try:
-            await text_channel.send(
-                "**Voice Tester Bot**\n"
-                "This bot is a privacy-focused tool for testing your microphone quality.\n"
-                "• It **only** records when you explicitly run `/voicetest` or click the **Test** button.\n"
-                "• It **only** records the user who triggered the command.\n"
-                "• Audio is stored **in-memory only** and is deleted immediately after playback.\n"
-                "• No data is sent to external servers."
-            )
+            # Check send permissions first to avoid 403 errors
+            try:
+                perms = text_channel.permissions_for(text_channel.guild.me)
+            except Exception:
+                perms = None
+
+            if perms and not perms.send_messages:
+                logger.info("Skipping text summary: missing send_messages permission in channel %s", getattr(text_channel, 'id', None))
+            else:
+                await text_channel.send(
+                    "**Voice Tester Bot**\n"
+                    "This bot is a privacy-focused tool for testing your microphone quality.\n"
+                    "• It **only** records when you explicitly run `/voicetest` or click the **Test** button.\n"
+                    "• It **only** records the user who triggered the command.\n"
+                    "• Audio is stored **in-memory only** and is deleted immediately after playback.\n"
+                    "• No data is sent to external servers."
+                )
         except Exception as e:
             logger.error(f"Failed to send text summary: {e}")
 
@@ -370,53 +420,7 @@ def _ensure_duration(dur: int, default: int, maximum: int) -> int:
 # on_app_command_error is registered inside `main()` where `bot` exists.
 
 
-class VoiceTestView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(
-        label="Join", style=discord.ButtonStyle.primary, custom_id="voicetest_join_btn"
-    )
-    async def join_button(
-        self, button: discord.ui.Button, interaction: discord.Interaction
-    ):
-        vc = await ensure_voice_connected(interaction)
-        if vc:
-            await interaction.response.send_message(
-                "Joined voice channel.", ephemeral=True
-            )
-            # Try to get the channel where the interaction happened
-            channel = interaction.channel if hasattr(interaction, "channel") else None
-            await play_join_sound(vc, text_channel=channel)
-
-    @discord.ui.button(
-        label="Leave", style=discord.ButtonStyle.danger, custom_id="voicetest_leave_btn"
-    )
-    async def leave_button(
-        self, button: discord.ui.Button, interaction: discord.Interaction
-    ):
-        vc = interaction.guild.voice_client
-        if vc:
-            await vc.disconnect()
-            await interaction.response.send_message(
-                "Left voice channel.", ephemeral=True
-            )
-        else:
-            await interaction.response.send_message("Not connected.", ephemeral=True)
-
-    @discord.ui.button(
-        label="Test", style=discord.ButtonStyle.success, custom_id="voicetest_test_btn"
-    )
-    async def test_button(
-        self, button: discord.ui.Button, interaction: discord.Interaction
-    ):
-        # Only allow pressing user to run test for themselves
-        dur = bot.default_duration if bot else 5
-        await run_voice_test(interaction, interaction.user, dur)
-
-
-def create_views():
-    return VoiceTestView()
+# Button-based UI removed: we now expose only slash commands (`/join`, `/leave`, `/voicetest`, `/stop`).
 
 
 async def run_voice_test(
@@ -713,7 +717,7 @@ def main():
         except Exception:
             bot.tts_available = False
             logger.exception("TTS probe raised an exception")
-        bot.add_view(VoiceTestView())
+        # UI views with buttons have been removed; only slash commands remain
 
         # Ensure application commands are synchronized with Discord's API.
         try:
@@ -787,10 +791,28 @@ def main():
                 "commands",
                 f"/join invoked by user={ctx.author.id} in guild={ctx.guild.id}",
             )
+        # Defer to give extra time for the voice connect
+        try:
+            await ctx.defer(ephemeral=True)
+        except Exception:
+            try:
+                await ctx.response.defer(ephemeral=True)
+            except Exception:
+                pass
+
         vc = await ensure_voice_connected(ctx)
         if not vc:
+            try:
+                await ctx.followup.send("Failed to join voice channel.", ephemeral=True)
+            except Exception:
+                pass
             return
-        await ctx.respond("Joined voice channel.", ephemeral=True)
+
+        try:
+            await ctx.followup.send("Joined voice channel.", ephemeral=True)
+        except Exception:
+            pass
+
         await play_join_sound(vc, text_channel=ctx.channel)
 
     @bot.slash_command(name="leave")
@@ -813,10 +835,8 @@ def main():
         dur = _ensure_duration(duration, bot.default_duration, bot.max_duration)
         await run_voice_test(ctx, ctx.author, dur)
 
-    @bot.slash_command(name="postvoicetestcommands")
-    async def post_commands(ctx: discord.ApplicationContext):
-        view = create_views()
-        await ctx.respond("Voice test controls:", view=view)
+    # Removed `/postvoicetestcommands` which posted interactive buttons.
+    # The bot now supports only slash commands: `/join`, `/leave`, `/voicetest`, `/stop`.
 
     @bot.slash_command(name="stop")
     async def stop_command(ctx: discord.ApplicationContext):
